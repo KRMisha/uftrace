@@ -9,6 +9,7 @@
 #include "libmcount/mcount.h"
 #include "libmcount/internal.h"
 #include "mcount-arch.h"
+#include "utils/membarrier.h"
 #include "utils/utils.h"
 #include "utils/symbol.h"
 #include "utils/rbtree.h"
@@ -120,6 +121,12 @@ int mcount_patch_func(struct mcount_dynamic_info *mdi, struct sym *sym,
 
 	/* flush icache so that cpu can execute the new code */
 	__builtin___clear_cache(insn, insn + CODE_SIZE);
+
+	/* membarrier to sync threads */
+	if (membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0) < 0) {
+		pr_err("failed to execute serializing instruction\n");
+		return INSTRUMENT_FAILED;
+	}
 
 	return INSTRUMENT_SUCCESS;
 }

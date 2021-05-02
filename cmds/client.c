@@ -39,6 +39,7 @@ int command_client(int argc, char *argv[], struct opts *opts) {
     xasprintf(&channel, "%s/%d.%s", run_dir, opts->pid, "socket");
     strncpy(addr.sun_path, channel,
             sizeof(addr.sun_path) - 1);
+    pr_dbg("opening socket at %s\n", channel);
 
     if (connect(sfd, (struct sockaddr *) &addr,
                 sizeof(struct sockaddr_un)) == -1)
@@ -142,4 +143,3 @@ int command_client(int argc, char *argv[], struct opts *opts) {
 
     return 0;
 }
-

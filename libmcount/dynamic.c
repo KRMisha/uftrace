@@ -23,6 +23,7 @@
 
 #include "libmcount/mcount.h"
 #include "libmcount/internal.h"
+#include "utils/membarrier.h"
 #include "utils/utils.h"
 #include "utils/symbol.h"
 #include "utils/filter.h"
@@ -322,17 +323,16 @@ static int find_dynamic_module(struct dl_phdr_info *info, size_t sz, void *data)
 	return !fmd->needs_modules;
 }
 
-static void prepare_dynamic_update(struct symtabs *symtabs,
-				   bool needs_modules)
+static void prepare_dynamic_update(struct symtabs *symtabs)
 {
 	struct find_module_data fmd = {
 		.symtabs = symtabs,
-		.needs_modules = needs_modules,
+		.needs_modules = false,
 	};
 	int hash_size = symtabs->exec_map->mod->symtab.nr_sym * 3 / 4;
 
-	if (needs_modules)
-		hash_size *= 2;
+	// if (needs_modules)
+	// 	hash_size *= 2;
 
 	code_hmap = hashmap_create(hash_size, hashmap_ptr_hash,
 				   hashmap_ptr_equals);
@@ -342,6 +342,7 @@ static void prepare_dynamic_update(struct symtabs *symtabs,
 
 struct mcount_dynamic_info *setup_trampoline(struct uftrace_mmap *map)
 {
+	static bool has_been_init = false;
 	struct mcount_dynamic_info *mdi;
 
 	for (mdi = mdinfo; mdi != NULL; mdi = mdi->next) {
@@ -350,10 +351,14 @@ struct mcount_dynamic_info *setup_trampoline(struct uftrace_mmap *map)
 	}
 
 	if (mdi != NULL && mdi->trampoline == 0) {
-		if (mcount_setup_trampoline(mdi) < 0)
-			mdi = NULL;
+		if (!has_been_init) {
+			if (mcount_setup_trampoline(mdi) < 0) {
+				mdi = NULL;
+			}
+		}
 	}
 
+	has_been_init = true;
 	return mdi;
 }
 
@@ -462,6 +467,8 @@ static void release_pattern_list(void)
 	}
 }
 
+static Hashmap* patched_syms = NULL; // Used to avoid double-patching
+
 static void patch_func_matched(struct mcount_dynamic_info *mdi,
 			       struct uftrace_mmap *map)
 {
@@ -476,6 +483,10 @@ static void patch_func_matched(struct mcount_dynamic_info *mdi,
 		"__libc_csu_init",
 		"__libc_csu_fini",
 	};
+
+	if (patched_syms == NULL) {
+		patched_syms = hashmap_create(10, hashmap_ptr_hash, hashmap_ptr_equals);
+	}
 
 	symtab = &map->mod->symtab;
 
@@ -497,8 +508,14 @@ static void patch_func_matched(struct mcount_dynamic_info *mdi,
 			continue;
 
 		if (!match_pattern_list(map, sym->name)) {
-			if (mcount_unpatch_func(mdi, sym, &disasm) == 0)
+			if (mcount_unpatch_func(mdi, sym, &disasm) == 0) {
 				stats.unpatch++;
+				hashmap_remove(patched_syms, sym->name);
+			}
+			continue;
+		}
+
+		if (hashmap_contains_key(patched_syms, sym->name)) {
 			continue;
 		}
 
@@ -514,7 +531,9 @@ static void patch_func_matched(struct mcount_dynamic_info *mdi,
 			default:
 				break;
 		}
+
 		stats.total++;
+		hashmap_put(patched_syms, sym->name, sym->name);
 	}
 
 	if (!found)
@@ -552,23 +571,23 @@ static int do_dynamic_update(struct symtabs *symtabs, char *patch_funcs,
 	return 0;
 }
 
-static void freeze_dynamic_update(void)
-{
-	struct mcount_dynamic_info *mdi, *tmp;
+// static void freeze_dynamic_update(void)
+// {
+// 	struct mcount_dynamic_info *mdi, *tmp;
 
-	mdi = mdinfo;
-	while (mdi) {
-		tmp = mdi->next;
+// 	mdi = mdinfo;
+// 	while (mdi) {
+// 		tmp = mdi->next;
 
-		mcount_arch_dynamic_recover(mdi, &disasm);
-		mcount_cleanup_trampoline(mdi);
-		free(mdi);
+// 		mcount_arch_dynamic_recover(mdi, &disasm);
+// 		mcount_cleanup_trampoline(mdi);
+// 		free(mdi);
 
-		mdi = tmp;
-	}
+// 		mdi = tmp;
+// 	}
 
-	mcount_freeze_code();
-}
+// 	mcount_freeze_code();
+// }
 
 /* do not use floating-point in libmcount */
 static int calc_percent(int n, int total, int *rem)
@@ -579,22 +598,29 @@ static int calc_percent(int n, int total, int *rem)
 	return quot;
 }
 
-int mcount_dynamic_update(struct symtabs *symtabs, char *patch_funcs,
-			  enum uftrace_pattern_type ptype)
+int mcount_dynamic_init(struct symtabs *symtabs)
 {
-	int ret = 0;
 	char *size_filter;
-	bool needs_modules = !!strchr(patch_funcs, '@');
 
 	mcount_disasm_init(&disasm);
-
-	prepare_dynamic_update(symtabs, needs_modules);
+	prepare_dynamic_update(symtabs);
 
 	size_filter = getenv("UFTRACE_PATCH_SIZE");
 	if (size_filter != NULL)
 		min_size = strtoul(size_filter, NULL, 0);
 
-	ret = do_dynamic_update(symtabs, patch_funcs, ptype);
+	if (membarrier(MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0) < 0) {
+		pr_err("failed to register intent to use MEMBARRIER_CMD_PRIVATE_EXPEDITED\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+int mcount_dynamic_update(struct symtabs *symtabs, char *patch_funcs,
+			  enum uftrace_pattern_type ptype)
+{
+	int ret = do_dynamic_update(symtabs, patch_funcs, ptype);
 
 	if (stats.total && stats.failed) {
 		int success = stats.total - stats.failed - stats.skipped;
@@ -612,7 +638,7 @@ int mcount_dynamic_update(struct symtabs *symtabs, char *patch_funcs,
 		pr_dbg("no match: %8d\n", stats.nomatch);
 	}
 
-	freeze_dynamic_update();
+	// freeze_dynamic_update();
 	return ret;
 }
 

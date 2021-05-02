@@ -398,7 +398,7 @@ static void mcount_filter_init(enum uftrace_pattern_type ptype, char *dirname,
 	};
 	bool needs_debug_info = false;
 
-	load_module_symtabs(&symtabs);
+	// load_module_symtabs(&symtabs);
 
 	mcount_signal_init(getenv("UFTRACE_SIGNAL"), &filter_setting);
 
@@ -824,7 +824,7 @@ void *command_daemon(void *arg) {
 
 	xasprintf(&channel, "%s/%d.%s", run_dir, pid, "socket");
 	strncpy(addr.sun_path, channel, sizeof(addr.sun_path) - 1);
-	pr_dbg3("using socket %s\n", channel);
+	pr_dbg("using socket %s\n", channel);
 
 	unlink(channel);
 	if (bind(sfd, (struct sockaddr *) &addr,
@@ -871,7 +871,12 @@ void *command_daemon(void *arg) {
 			case UFTRACE_DOPT_PATCH: /* TODO */
 				if (read(cfd, buf, MCOUNT_DOPT_SIZE) == -1)
 					pr_err("error reading option");
-				pr_dbg("option not supported yet\n");
+				pr_dbg("received patch: %s\n", buf);
+				if (mcount_dynamic_update(&symtabs, buf, PATT_SIMPLE) < 0) {
+					pr_dbg("mcount_dynamic_update failed\n");
+				} else {
+					pr_dbg("mcount_dynamic_update success\n");
+				}
 				break;
 
 			case UFTRACE_DOPT_FILTER: /* -F or -N */
@@ -1010,7 +1015,7 @@ struct mcount_thread_data * mcount_prepare(void)
 	if (!mcount_guard_recursion(mtdp))
 		return NULL;
 
-	pr_dbg2("staring daemon\n");
+	pr_dbg2("starting daemon\n");
 	pthread_create(&daemon_thread, NULL, &command_daemon, NULL);
 
 	compiler_barrier();
@@ -2102,6 +2107,7 @@ static __used void mcount_startup(void)
 	symtabs.filename = mcount_exename;
 
 	record_proc_maps(dirname, mcount_session_name(), &symtabs);
+	load_module_symtabs(&symtabs);
 
 	if (pattern_str)
 		patt_type = parse_filter_pattern(pattern_str);
@@ -2120,6 +2126,7 @@ static __used void mcount_startup(void)
 	if (threshold_str)
 		mcount_threshold = strtoull(threshold_str, NULL, 0);
 
+	mcount_dynamic_init(&symtabs);
 	if (patch_str)
 		mcount_dynamic_update(&symtabs, patch_str, patt_type);
 
